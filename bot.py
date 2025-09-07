@@ -21,7 +21,7 @@ from ml_reporting import MLReporter
 load_dotenv()
 
 # === USER SETTINGS ===
-APP_ID = os.getenv("APP_ID", "")
+APP_ID = os.getenv("APP_ID", "65770")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN", "")
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 
