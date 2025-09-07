@@ -7,7 +7,6 @@ import logging
 import requests
 import os
 import numpy as np
-import talib
 import pandas as pd
 from datetime import datetime, timedelta
 from collections import deque
@@ -183,34 +182,43 @@ def synthetic_market_adjustment(signal_strength, volatility, symbol):
     return signal_strength * adjustment
 
 def compute_rsi(prices, period=14):
+    """Calculate RSI manually without TA-Lib"""
     if len(prices) < period + 1:
         return 50
     
-    # Use talib for more accurate RSI calculation
-    try:
-        rsi = talib.RSI(np.array(prices), timeperiod=period)[-1]
-        if np.isnan(rsi):
-            return 50
-        return rsi
-    except:
-        # Fallback calculation if talib fails
-        gains = []
-        losses = []
-        for i in range(1, len(prices)):
-            change = prices[i] - prices[i-1]
-            gains.append(max(change, 0))
-            losses.append(max(-change, 0))
+    # Manual RSI calculation
+    gains = []
+    losses = []
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    
+    if len(gains) < period or len(losses) < period:
+        return 50
         
-        if len(gains) < period or len(losses) < period:
-            return 50
-            
-        avg_gain = np.mean(gains[-period:])
-        avg_loss = np.mean(losses[-period:])
-        
-        if avg_loss == 0:
-            return 100
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_ema(prices, period):
+    """Calculate Exponential Moving Average manually"""
+    if len(prices) < period:
+        return np.mean(prices) if prices else prices[-1] if prices else 0
+    
+    # EMA calculation: weight = 2 / (period + 1)
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    
+    # For the first few values where we don't have enough data, use SMA
+    if len(prices) < period * 2:
+        return np.convolve(prices, weights, mode='valid')[-1]
+    else:
+        return np.convolve(prices[-period:], weights, mode='valid')[0]
 
 def compute_signal(window):
     """Improved signal generation with multiple technical indicators"""
@@ -219,16 +227,17 @@ def compute_signal(window):
     
     prices = np.array(window)
     
-    # Use EMA crossovers instead of simple MA
-    ema_short = talib.EMA(prices, timeperiod=8)[-1]
-    ema_long = talib.EMA(prices, timeperiod=21)[-1]
+    # Use EMA crossovers (manual calculation)
+    ema_short = calculate_ema(prices, 8)
+    ema_long = calculate_ema(prices, 21)
     
     # RSI with better handling
     rsi = compute_rsi(prices)
     
-    # MACD for momentum
-    macd, macd_signal, _ = talib.MACD(prices)
-    macd_value = macd[-1] - macd_signal[-1] if not np.isnan(macd[-1]) else 0
+    # Simple MACD-like momentum calculation
+    short_avg = calculate_ema(prices, 12) if len(prices) >= 12 else 0
+    long_avg = calculate_ema(prices, 26) if len(prices) >= 26 else 0
+    macd_value = short_avg - long_avg
     
     # Generate signals with confidence scores
     signal_strength = 0
