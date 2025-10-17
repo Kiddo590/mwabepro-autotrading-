@@ -31,11 +31,10 @@ TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", "50.0"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "500.0"))
 MAX_HOURLY_LOSS = float(os.getenv("MAX_HOURLY_LOSS", "500.0"))
 
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.3"))
-VOLATILITY_THRESHOLD = float(os.getenv("VOLATILITY_THRESHOLD", "0.1"))
+# FIXED: Lower confidence threshold and volatility threshold for synthetic markets
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.15"))  # Reduced from 0.3
+VOLATILITY_THRESHOLD = float(os.getenv("VOLATILITY_THRESHOLD", "0.00005"))  # Much lower for synthetics
 
-NEWS_THRESHOLD = float(os.getenv("NEWS_THRESHOLD", "0.0"))
-NEWS_CHECK_INTERVAL = int(os.getenv("NEWS_CHECK_INTERVAL", "60"))
 TICKS_HISTORY = int(os.getenv("TICKS_HISTORY", "100"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -55,24 +54,11 @@ logger = logging.getLogger("deriv-bot")
 ticks = deque(maxlen=TICKS_HISTORY)
 daily_pnl = 0.0
 hourly_pnl = 0.0
-last_news_check = datetime.min
 last_hour_reset = datetime.now()
 account_balance = 10000.0
 trade_history = []
 win_rate = 0.5
 trade_outcomes = []  # Track trade outcomes for ML learning
-
-# === News Gate Fallback ===
-class NewsGate:
-    def __init__(self, api_key=""):
-        self.api_key = api_key
-        
-    def get_sentiment(self):
-        # Fallback sentiment if news API is not available
-        return 0.1  # Neutral sentiment
-
-# Initialize news gate
-news_gate = NewsGate(api_key=os.getenv("NEWS_API_KEY", ""))
 
 # === Risk Management ===
 class EnhancedRiskManager:
@@ -102,25 +88,25 @@ class EnhancedRiskManager:
             logger.warning("Hourly loss limit reached")
             return False
             
-        if self.trade_count_hour >= 10:  # Max 10 trades per hour
+        if self.trade_count_hour >= 20:  # Increased from 10 to allow more trades
             logger.warning("Max trades per hour reached")
             return False
             
-        # ML-based risk adjustments
+        # FIXED: Less restrictive ML confidence checks
         if len(self.ml_confidence_history) > 10:
             avg_confidence = np.mean(self.ml_confidence_history[-10:])
-            if avg_confidence < 0.4:  # ML has been uncertain recently
-                return signal_strength > 0.7  # Require stronger signals
+            if avg_confidence < 0.3:  # Reduced from 0.4
+                return signal_strength > 0.5  # Reduced from 0.7
         
         # Recent performance-based adjustments
         if len(self.trade_results) > 5:
             recent_wins = sum(self.trade_results[-5:])
             if recent_wins <= 1:  # Poor recent performance
-                return signal_strength > 0.6
+                return signal_strength > 0.4  # Reduced from 0.6
                 
-        # Allow trading even in higher volatility if signal is decent
-        if volatility > VOLATILITY_THRESHOLD:
-            return signal_strength > 0.5
+        # FIXED: Allow trading in all volatility conditions with adjusted thresholds
+        if volatility > VOLATILITY_THRESHOLD * 2:  # More permissive
+            return signal_strength > 0.3  # Reduced threshold
             
         return True
     
@@ -173,13 +159,49 @@ def synthetic_market_adjustment(signal_strength, volatility, symbol):
     if not is_synthetic_symbol(symbol):
         return signal_strength
     
-    # Synthetic markets often have higher volatility and different patterns
-    # Reduce position size and require higher confidence
-    adjustment = 0.8  # Reduce signal strength
-    if volatility > 0.15:  # Very high volatility common in synthetics
-        adjustment *= 0.7
+    # FIXED: More aggressive adjustments for synthetic markets
+    # Synthetic markets need different signal strength handling
+    if volatility < 0.0001:  # Even lower threshold for synthetics
+        return signal_strength * 1.3  # Increase confidence more in low vol
     
-    return signal_strength * adjustment
+    return signal_strength * 1.1  # Always slightly increase for synthetics
+
+def compute_synthetic_signal(window):
+    """Special signal detection for synthetic markets like R_100"""
+    if len(window) < 5:  # Reduced from 10 for faster signals
+        return None, 0.0
+    
+    prices = np.array(window)
+    
+    # FIXED: Simplified momentum detection for faster signals
+    recent_prices = prices[-3:]  # Use only last 3 prices
+    earlier_prices = prices[-6:-3] if len(prices) >= 6 else prices[:3]
+    
+    if len(recent_prices) < 3 or len(earlier_prices) < 3:
+        return None, 0.0
+    
+    recent_avg = np.mean(recent_prices)
+    earlier_avg = np.mean(earlier_prices)
+    
+    # Calculate momentum
+    momentum = (recent_avg - earlier_avg) / earlier_avg if earlier_avg != 0 else 0
+    
+    # FIXED: Lower thresholds for synthetic signal generation
+    volatility = np.std(prices[-5:]) / np.mean(prices[-5:]) if len(prices) >= 5 else 0
+    
+    # Generate signals with lower thresholds
+    if momentum > 0.0005 and volatility > 0.00005:  # Much lower thresholds
+        return "CALL", 0.4 + min(0.3, abs(momentum) * 100)
+    elif momentum < -0.0005 and volatility > 0.00005:
+        return "PUT", 0.4 + min(0.3, abs(momentum) * 100)
+    
+    # Weak momentum signals
+    if momentum > 0.0002:
+        return "CALL", 0.25
+    elif momentum < -0.0002:
+        return "PUT", 0.25
+    
+    return None, 0.0
 
 def compute_rsi(prices, period=14):
     """Calculate RSI manually without TA-Lib"""
@@ -222,37 +244,49 @@ def calculate_ema(prices, period):
 
 def compute_signal(window):
     """Improved signal generation with multiple technical indicators"""
-    if len(window) < 20:  # Need more data for reliable signals
+    if len(window) < 5:  # Reduced from 10 for much faster signal generation
         return None, 0.0
+    
+    # FIXED: Always use synthetic-specific logic for R_100
+    if is_synthetic_symbol(SYMBOL):
+        return compute_synthetic_signal(window)
     
     prices = np.array(window)
     
     # Use EMA crossovers (manual calculation)
-    ema_short = calculate_ema(prices, 8)
-    ema_long = calculate_ema(prices, 21)
+    ema_short = calculate_ema(prices, 5)  # Reduced periods
+    ema_long = calculate_ema(prices, 12)  # Reduced periods
     
     # RSI with better handling
-    rsi = compute_rsi(prices)
+    rsi = compute_rsi(prices, 10)  # Reduced period
     
-    # Simple MACD-like momentum calculation
-    short_avg = calculate_ema(prices, 12) if len(prices) >= 12 else 0
-    long_avg = calculate_ema(prices, 26) if len(prices) >= 26 else 0
-    macd_value = short_avg - long_avg
+    # Simple momentum calculation
+    momentum = (prices[-1] - prices[-5]) / prices[-5] if len(prices) >= 5 else 0
     
     # Generate signals with confidence scores
     signal_strength = 0
     signal = None
     
-    if ema_short > ema_long and rsi > 40 and rsi < 80:
-        signal_strength += 0.3
-        if macd_value > 0:
-            signal_strength += 0.2
+    # FIXED: More permissive signal conditions
+    if ema_short > ema_long and rsi > 35:  # Reduced from 40
+        signal_strength += 0.25  # Reduced from 0.3
+        if momentum > 0:
+            signal_strength += 0.15  # Reduced from 0.2
         signal = "CALL"
-    elif ema_short < ema_long and rsi < 60 and rsi > 20:
-        signal_strength += 0.3
-        if macd_value < 0:
-            signal_strength += 0.2
+    elif ema_short < ema_long and rsi < 65:  # Increased from 60
+        signal_strength += 0.25
+        if momentum < 0:
+            signal_strength += 0.15
         signal = "PUT"
+    
+    # Additional momentum-based signals
+    if abs(momentum) > 0.001:  # Lower threshold
+        if momentum > 0 and signal != "PUT":  # Don't contradict existing signal
+            signal = "CALL"
+            signal_strength = max(signal_strength, 0.3)
+        elif momentum < 0 and signal != "CALL":
+            signal = "PUT" 
+            signal_strength = max(signal_strength, 0.3)
     
     # Apply synthetic market adjustment
     signal_strength = synthetic_market_adjustment(signal_strength, estimate_volatility(window), SYMBOL)
@@ -267,7 +301,7 @@ def estimate_volatility(window):
     var = sum((r - mean) ** 2 for r in rets) / len(rets)
     return math.sqrt(var)
 
-def calculate_hurst_exponent(prices, max_lag=20):
+def calculate_hurst_exponent(prices, max_lag=10):  # Reduced max_lag
     """Calculate Hurst exponent to detect market regime"""
     if len(prices) < max_lag * 2:
         return 0.5  # Neutral value when not enough data
@@ -297,25 +331,25 @@ def calculate_hurst_exponent(prices, max_lag=20):
 
 def detect_market_regime(window):
     """Improved market regime detection"""
-    if len(window) < 30:  # Reduced from 50 to get faster detection
-        return "normal"  # Default to normal instead of unknown
+    if len(window) < 10:  # Reduced from 20 for faster detection
+        return "normal"
     
     prices = np.array(window)
-    returns = np.diff(np.log(prices + 1e-10))  # Add small value to avoid log(0)
     
-    # Calculate volatility regimes
-    volatility = np.std(returns[-15:]) * np.sqrt(252)  # Annualized
+    # FIXED: Use simpler volatility calculation for synthetics
+    volatility = estimate_volatility(window)
     
-    if volatility > 0.4:
+    # Adjusted thresholds for synthetic markets
+    if volatility > 0.0003:  # Lower threshold for high vol
         return "high_volatility"
-    elif volatility < 0.15:
+    elif volatility < 0.00008:  # Lower threshold for low vol
         return "low_volatility"
     
     # Check for trending vs mean-reverting using Hurst exponent
     hurst_exponent = calculate_hurst_exponent(prices)
-    if hurst_exponent > 0.6:
+    if hurst_exponent > 0.55:  # Reduced threshold
         return "trending"
-    elif hurst_exponent < 0.4:
+    elif hurst_exponent < 0.45:  # Increased threshold
         return "mean_reverting"
     
     return "normal"
@@ -323,39 +357,44 @@ def detect_market_regime(window):
 def adjust_strategy_for_regime(regime, signal, confidence):
     """Adjust strategy based on market regime"""
     if regime == "high_volatility":
-        return signal, confidence * 0.7
+        return signal, confidence * 0.8  # Reduced from 0.7
     elif regime == "low_volatility":
-        return signal, confidence * 0.9
+        return signal, confidence * 1.2  # Increased from 0.9
     elif regime == "trending":
-        return signal, confidence * 1.1
+        return signal, confidence * 1.3  # Increased from 1.1
     elif regime == "mean_reverting":
         # Reverse signals in mean-reverting markets
         if signal == "CALL":
-            return "PUT", confidence * 0.9
+            return "PUT", confidence * 1.1  # Increased from 0.9
         elif signal == "PUT":
-            return "CALL", confidence * 0.9
+            return "CALL", confidence * 1.1
     return signal, confidence
 
 def combine_signals(tech_signal, tech_confidence, ml_signal, ml_confidence, regime, ml_training_samples):
     """Combine technical and ML signals with regime awareness"""
-    # Determine weights based on ML training level
-    if ml_training_samples > 200 and ml_confidence > 0.6:
-        ml_weight = 0.7
-        tech_weight = 0.3
-    elif ml_training_samples > 50:
+    # FIXED: More permissive ML weighting
+    if ml_training_samples > 100 and ml_confidence > 0.4:  # Reduced thresholds
+        ml_weight = 0.6  # Reduced from 0.7
+        tech_weight = 0.4
+    elif ml_training_samples > 25:  # Reduced from 50
         ml_weight = 0.5
         tech_weight = 0.5
     else:
-        ml_weight = 0.3
-        tech_weight = 0.7
+        ml_weight = 0.4  # Increased from 0.3
+        tech_weight = 0.6
     
-    if tech_signal == ml_signal and ml_confidence > 0.5:
+    if tech_signal == ml_signal and ml_confidence > 0.4:  # Reduced from 0.5
         combined_confidence = (tech_confidence * tech_weight + ml_confidence * ml_weight)
         return tech_signal, combined_confidence
-    elif ml_confidence > 0.6:
+    elif ml_confidence > 0.5:  # Reduced from 0.6
         return ml_signal, ml_confidence * ml_weight
-    elif tech_confidence > 0.6 and regime in ["trending", "mean_reverting"]:
+    elif tech_confidence > 0.4 and regime in ["trending", "mean_reverting", "normal"]:  # Added normal
         return tech_signal, tech_confidence * tech_weight
+    
+    # FIXED: Return technical signal even if confidence is lower
+    if tech_signal and tech_confidence > 0.2:  # New condition
+        return tech_signal, tech_confidence * 0.8
+    
     return None, 0.0
 
 def dynamic_position_sizing(volatility, account_balance, win_rate, consecutive_losses=0):
@@ -367,19 +406,19 @@ def dynamic_position_sizing(volatility, account_balance, win_rate, consecutive_l
         kelly_fraction = win_rate - (1 - win_rate) / (1/win_rate if win_rate > 0 else 1)
         base_size = account_balance * max(0.01, min(0.05, kelly_fraction * 0.5))
     
-    # Volatility adjustment
-    vol_adjustment = min(1.0, 0.08 / max(volatility, 0.001))
+    # Volatility adjustment - more permissive
+    vol_adjustment = min(1.5, 0.1 / max(volatility, 0.0001))  # Increased max adjustment
     
     # Reduce size after losses
-    loss_adjustment = 1.0 / (1 + consecutive_losses * 0.5)
+    loss_adjustment = 1.0 / (1 + consecutive_losses * 0.3)  # Reduced penalty
     
     # Synthetic market adjustment
     if is_synthetic_symbol(SYMBOL):
-        vol_adjustment *= 0.7  # Smaller positions in synthetic markets
+        vol_adjustment *= 0.9  # Less reduction for synthetic markets
     
     position_size = base_size * vol_adjustment * loss_adjustment
     
-    return max(10.0, min(position_size, account_balance * 0.03))  # Max 3% of account
+    return max(10.0, min(position_size, account_balance * 0.05))  # Increased max to 5% of account
 
 def risk_allows_trade(size_usd):
     """Check if risk management allows trading"""
@@ -405,12 +444,12 @@ def seasonal_adjustment():
     """Adjust strategy based on time of day"""
     hour = datetime.now().hour
     if hour in [0, 1, 2, 12, 13]:  # Low liquidity hours
-        return 0.7
+        return 0.8  # Reduced from 0.7
     return 1.0
 
 def collect_market_data():
     """Collect comprehensive market data for ML training"""
-    if len(ticks) < 50:  # Need sufficient data
+    if len(ticks) < 10:  # Reduced from 20 for faster data collection
         return None, None
     
     current_window = list(ticks)
@@ -481,7 +520,7 @@ async def collect_periodic_data():
     while True:
         try:
             await asyncio.sleep(300)  # Collect every 5 minutes
-            if len(ticks) >= 50:
+            if len(ticks) >= 10:  # Reduced threshold
                 features, context = collect_market_data()
                 if features is not None:
                     # Store for later analysis
@@ -667,21 +706,23 @@ async def place_trade(ws, symbol, trade_type, size_usd, ml_features=None, regime
         return False
 
 async def run_bot():
-    global last_news_check, last_hour_reset, win_rate, hourly_pnl, daily_pnl
+    global last_hour_reset, win_rate, hourly_pnl, daily_pnl
     
-    logger.info("Starting bot SYMBOL=%s PAPER=%s", SYMBOL, PAPER_MODE)
+    logger.info("=== STARTING BOT WITH FIXED SIGNAL GENERATION ===")
+    logger.info("SYMBOL=%s PAPER=%s", SYMBOL, PAPER_MODE)
     logger.info("Trade size: $%.2f, Daily loss limit: $%.2f, Hourly loss limit: $%.2f", 
                 TRADE_SIZE_USD, MAX_DAILY_LOSS, MAX_HOURLY_LOSS)
-    logger.info("ADJUSTED PARAMETERS: Confidence threshold=%.2f, Volatility threshold=%.3f", 
+    logger.info("FIXED PARAMETERS: Confidence threshold=%.2f, Volatility threshold=%.6f", 
                 CONFIDENCE_THRESHOLD, VOLATILITY_THRESHOLD)
     
     # Check if trading on synthetic market
     if is_synthetic_symbol(SYMBOL):
         logger.info("Trading on SYNTHETIC market: %s", SYMBOL)
-        send_telegram(f"Trading on SYNTHETIC market: {SYMBOL}")
+        send_telegram(f"🤖 Trading on SYNTHETIC market: {SYMBOL}")
+        logger.info("Using synthetic-optimized signal generation")
     else:
         logger.info("Trading on NON-SYNTHETIC market: %s", SYMBOL)
-        send_telegram(f"Trading on NON-SYNTHETIC market: {SYMBOL}")
+        send_telegram(f"🤖 Trading on NON-SYNTHETIC market: {SYMBOL}")
     
     # Start ML services
     reporting_task = asyncio.create_task(ml_reporter.start_reporting())
@@ -710,7 +751,7 @@ async def run_bot():
                     await ws.send(json.dumps({"ticks": SYMBOL}))
                     logger.info("Subscribed to ticks for %s", SYMBOL)
                     last_ping = time.time()
-                    news_ok = True
+                    news_ok = True  # Always true for synthetic trading
 
                     while True:
                         msg_task = asyncio.create_task(ws.recv())
@@ -735,20 +776,8 @@ async def run_bot():
                             risk_manager.trade_count_hour = 0
                             logger.info("Hourly PNL reset")
 
-                        # News sentiment check
-                        if (datetime.utcnow() - last_news_check).total_seconds() > NEWS_CHECK_INTERVAL:
-                            last_news_check = datetime.utcnow()
-                            sentiment = news_gate.get_sentiment()
-                            logger.info("News sentiment %.3f", sentiment)
-                            if sentiment < NEWS_THRESHOLD:
-                                logger.warning("News blocks trading (%.3f<%.3f)",
-                                               sentiment, NEWS_THRESHOLD)
-                                send_telegram(f"NEWS BLOCK: sentiment={sentiment:.3f}")
-                                news_ok = False
-                            else:
-                                news_ok = True
-
-                        if len(ticks) >= 20:
+                        # FIXED: Simplified trading logic with fewer data requirements
+                        if len(ticks) >= 5:  # Reduced from 10 for much faster trading
                             # Collect market data for ML
                             features, market_context = collect_market_data()
                             
@@ -760,7 +789,10 @@ async def run_bot():
                             technical_signal, tech_confidence = compute_signal(current_window)
                             
                             # Get ML prediction using enhanced ML
-                            ml_prediction, ml_confidence = ml_predictor.predict(features)
+                            ml_prediction = None
+                            ml_confidence = 0.0
+                            if features is not None:
+                                ml_prediction, ml_confidence = ml_predictor.predict(features)
                             
                             # Get ML training stats for weight calculation
                             ml_stats = ml_predictor.get_training_stats()
@@ -783,22 +815,24 @@ async def run_bot():
                                          final_signal, signal_confidence, regime, volatility, size, 
                                          training_samples)
                             
-                            # Use the confidence threshold
-                            if (final_signal and news_ok and signal_confidence > CONFIDENCE_THRESHOLD and 
+                            # FIXED: Use the lower confidence threshold
+                            if (final_signal and signal_confidence > CONFIDENCE_THRESHOLD and 
                                 risk_allows_trade(size) and risk_manager.should_trade(signal_confidence, volatility, ml_confidence)):
                                 
+                                logger.info("🎯 EXECUTING TRADE: %s (Confidence: %.2f, Size: $%.2f)", 
+                                           final_signal, signal_confidence, size)
                                 trade_success = await place_trade(ws, SYMBOL, final_signal, size, features, regime)
-                                await asyncio.sleep(2)
+                                await asyncio.sleep(1)  # Reduced from 2 seconds
 
                         # Check loss limits
                         if daily_pnl <= -abs(MAX_DAILY_LOSS):
                             logger.critical("Daily loss cap hit, sleeping.")
-                            send_telegram(f"Daily loss cap hit: {daily_pnl:.2f}.")
+                            send_telegram(f"🔴 Daily loss cap hit: {daily_pnl:.2f}.")
                             await asyncio.sleep(60 * 60 * 6)
                             
                         if hourly_pnl <= -abs(MAX_HOURLY_LOSS):
                             logger.critical("Hourly loss cap hit, sleeping.")
-                            send_telegram(f"Hourly loss cap hit: {hourly_pnl:.2f}.")
+                            send_telegram(f"🔴 Hourly loss cap hit: {hourly_pnl:.2f}.")
                             await asyncio.sleep(60 * 30)
 
                         # Daily data export (at midnight)

@@ -1,0 +1,14 @@
+{
+  "total_predictions": 40,
+  "overall_accuracy": 0.35,
+  "regime_stats": {
+    "trending": {
+      "total": 32,
+      "accuracy": 0.40625
+    },
+    "mean_reverting": {
+      "total": 8,
+      "accuracy": 0.125
+    }
+  }
+}
